@@ -234,6 +234,23 @@ entries:
     version: 0.2.0
   trino-gateway:
   - apiVersion: v2
+    appVersion: "19"
+    created: "2026-05-13T13:04:24.395771601Z"
+    description: A Helm chart for Trino Gateway
+    digest: ba0f153c6da1319f6a886fafd24b035f8713625e16e45d29166fee0865b0e299
+    home: https://trinodb.github.io/trino-gateway/
+    icon: https://trino.io/assets/images/logos/trino-gateway-small.png
+    maintainers:
+    - name: Trino community
+    name: trino-gateway
+    sources:
+    - https://github.com/trinodb/charts
+    - https://github.com/trinodb/trino-gateway
+    type: application
+    urls:
+    - https://github.com/simpligility/charts/releases/download/trino-gateway-1.19.0/trino-gateway-1.19.0.tgz
+    version: 1.19.0
+  - apiVersion: v2
     appVersion: "18"
     created: "2026-04-15T02:36:02.599607236Z"
     description: A Helm chart for Trino Gateway
@@ -250,4 +267,4 @@ entries:
     urls:
     - https://github.com/simpligility/charts/releases/download/trino-gateway-1.18.0/trino-gateway-1.18.0.tgz
     version: 1.18.0
-generated: "2026-05-11T20:13:35.537554259Z"
+generated: "2026-05-13T13:04:24.395810203Z"

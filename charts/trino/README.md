@@ -1,6 +1,6 @@
 # trino
 
-![Version: 1.42.2](https://img.shields.io/badge/Version-1.42.2-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: 480](https://img.shields.io/badge/AppVersion-480-informational?style=flat-square)
+![Version: 1.45.0](https://img.shields.io/badge/Version-1.45.0-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: 484](https://img.shields.io/badge/AppVersion-484-informational?style=flat-square)
 
 Fast distributed SQL query engine for big data analytics that helps you explore your data universe
 
@@ -49,6 +49,18 @@ Fast distributed SQL query engine for big data analytics that helps you explore 
   imagePullSecrets:
     - name: registry-credentials
   ```
+* `testImages` - object, default: `{"kubectl":{"pullPolicy":"IfNotPresent","repository":"alpine/kubectl","tag":"1.37.1"},"postgresql":{"pullPolicy":"IfNotPresent","repository":"postgres","tag":"18-alpine"},"python":{"pullPolicy":"IfNotPresent","repository":"python","tag":"3-slim"}}`  
+
+  Images of the containers the chart's [Helm tests](https://helm.sh/docs/topics/chart_tests/) run, so a cluster that pulls through a mirror can run them too. The registry prefix is shared with the Trino image and comes from `image.registry`.
+* `testImages.kubectl` - object, default: `{"pullPolicy":"IfNotPresent","repository":"alpine/kubectl","tag":"1.37.1"}`  
+
+  Used by the graceful shutdown test to watch and delete a worker pod. It needs a shell, so a distroless image such as `registry.k8s.io/kubectl` does not work here.
+* `testImages.postgresql` - object, default: `{"pullPolicy":"IfNotPresent","repository":"postgres","tag":"18-alpine"}`  
+
+  Used by the connection test to seed the resource groups database, so it is only pulled when `resourceGroups.type` is `properties`.
+* `testImages.python` - object, default: `{"pullPolicy":"IfNotPresent","repository":"python","tag":"3-slim"}`  
+
+  Used by the JMX test to query the Prometheus targets the ServiceMonitor produced.
 * `server.workers` - int, default: `2`
 * `server.node.environment` - string, default: `"production"`  
 
@@ -167,8 +179,12 @@ Fast distributed SQL query engine for big data analytics that helps you explore 
         metricName: required_workers
         query: >-
           sum by (service)
-          (avg_over_time(trino_execution_ClusterSizeMonitor_RequiredWorkers{service={{ include "trino.fullname" . | quote }}}[5s]))
+          (avg_over_time(trino_execution_name_ClusterSizeMonitor_RequiredWorkers{service={{ include "trino.fullname" . | quote }}}[5s]))
   ```
+  The metric name above is the one Trino's own OpenMetrics endpoint exports,
+  which `serviceMonitor` scrapes by default. The `jmx.exporter` sidecar names
+  the same MBean attribute `trino_execution_ClusterSizeMonitor_RequiredWorkers`,
+  without the `name_` segment.
 * `server.keda.annotations` - object, default: `{}`  
 
   Annotations to apply to the ScaledObject CRD.
@@ -181,6 +197,36 @@ Fast distributed SQL query engine for big data analytics that helps you explore 
 * `accessControl` - object, default: `{}`  
 
   [System access control](https://trino.io/docs/current/security/built-in-system-access-control.html) configuration.
+  These settings apply to the coordinator and to the workers. Settings meant
+  for one role only go in a `coordinator` or a `worker` block, where they
+  override the shared ones.
+  A rules document denies whatever it does not allow, and both roles serve the
+  management endpoints, so a document without a `system_information` section
+  denies every management read, the metrics endpoint among them, on the
+  coordinator and on the workers alike. The rules are evaluated in order and
+  the first one matching a user decides, so a rule that matches a user without
+  granting `read` denies that user as surely as no rule at all.
+  Granting a user read access to system information on workers takes nothing
+  more than:
+  ```yaml
+   worker:
+     type: configmap
+     rules:
+       rules.json: |-
+         {
+           "system_information": [
+             {
+               "user": "prometheus",
+               "allow": ["read"]
+             }
+           ]
+         }
+  ```
+  When `worker.gracefulShutdown` is enabled, the chart merges the permission to
+  write system information for `worker.gracefulShutdown.user` into the worker
+  rules, so the shutdown request keeps working next to the rules configured
+  here. Those rules have to be of the `configmap` type, because the permission
+  cannot be merged into opaque properties.
   Set the type property to either:
   * `configmap`, and provide the rule file contents in `rules`,
   * `properties`, and provide configuration properties in `properties`.
@@ -243,6 +289,95 @@ Fast distributed SQL query engine for big data analytics that helps you explore 
          ]
        }
   ```
+* `opa.enabled` - bool, default: `false`  
+
+  Set to true to deploy an [Open Policy Agent](https://www.openpolicyagent.org/) sidecar container on the Trino coordinator pod.
+  When `opa.enabled` is true and `accessControl` is left at its default
+  (empty `{}`), the chart automatically wires Trino's access-control plugin
+  to this sidecar using `opa.policyPath` and the optional `opa.*Path` /
+  `opa.log*` / `opa.allowPermissionManagementOperations` values. To
+  customize further, set `accessControl.type: properties` and provide the
+  full `accessControl.properties` block; any `accessControl` value disables
+  auto-wiring.
+* `opa.image` - string, default: `"openpolicyagent/opa:1.21.2-static"`  
+
+  OPA container image. The `-static` variant is recommended: it ships without a shell which keeps the attack surface small. Check for newer versions at https://hub.docker.com/r/openpolicyagent/opa/tags
+* `opa.pullPolicy` - string, default: `"IfNotPresent"`
+* `opa.listenAddress` - string, default: `"127.0.0.1"`  
+
+  Address OPA binds its API to inside the coordinator pod. The default keeps it on loopback, where Trino reaches it and nothing outside the pod can: OPA's API is writable and unauthenticated, so a request that arrives there can replace the policy. The probes use `opa.diagnosticPort` rather than this address, so there is no need to widen it for them.
+* `opa.port` - int, default: `8181`  
+
+  Port OPA listens on inside the coordinator pod. The URIs Trino is given are built from it, so there is nothing else to keep in step.
+* `opa.diagnosticPort` - int, default: `8282`  
+
+  Port of OPA's read-only diagnostic listener, which serves `/health` and `/metrics` and nothing else. It binds to all addresses so the kubelet can probe it, which is why the API itself does not have to.
+* `opa.policyPath` - string, default: `"/v1/data/trino/allow"`  
+
+  Path of the document Trino asks for an authorization decision. The sidecar shares the coordinator's network, so the chart addresses it over loopback on `opa.port` and only the path is configured here.
+* `opa.columnMaskingPath` - string, default: `""`  
+
+  Path of the document for column-masking decisions. When set, the auto-wired access control adds `opa.policy.column-masking-uri`. Leave empty to omit.
+* `opa.rowFiltersPath` - string, default: `""`  
+
+  Path of the document for row-filter decisions. When set, the auto-wired access control adds `opa.policy.row-filters-uri`. Leave empty to omit.
+* `opa.batchedPath` - string, default: `""`  
+
+  Path of the document for batched authorization decisions. When set, the auto-wired access control adds `opa.policy.batched-uri`. Leave empty to omit.
+* `opa.logRequests` - bool, default: `false`  
+
+  When true, the auto-wired access-control adds `opa.log-requests=true`, logging every request Trino sends to OPA.
+* `opa.logResponses` - bool, default: `false`  
+
+  When true, the auto-wired access-control adds `opa.log-responses=true`, logging every response Trino receives from OPA.
+* `opa.allowPermissionManagementOperations` - bool, default: `false`  
+
+  When true, the auto-wired access-control adds `opa.allow-permission-management-operations=true`, allowing CREATE/DROP ROLE, GRANT, REVOKE, and similar statements without OPA evaluation.
+* `opa.policy` - object, default: `{}`  
+
+  Rego policy files to render into a ConfigMap and mount into the OPA container at `opa.policyMountPath`. Provide one or more entries, each keyed by file name (e.g. `policy.rego`, `data.json`). Mutually exclusive with `opa.policyConfigMap`. Exactly one of the two must be set when `opa.enabled` is true.
+  Example:
+  ```yaml
+  policy:
+    policy.rego: |
+      package trino
+      import rego.v1
+      default allow := false
+      allow if {
+        input.context.identity.user == "alice"
+      }
+  ```
+* `opa.policyConfigMap` - string, default: `""`  
+
+  Name of an existing ConfigMap holding the OPA policy files. Mutually exclusive with `opa.policy`.
+* `opa.policyMountPath` - string, default: `"/policies"`  
+
+  Directory inside the OPA container where the policy files are mounted.
+* `opa.extraArgs` - list, default: `[]`  
+
+  Additional flags appended to the `opa run` command, before the policy directory positional argument.
+  Example:
+  ```yaml
+  extraArgs:
+    - --log-level=debug
+  ```
+* `opa.securityContext` - object, default: `{"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]},"readOnlyRootFilesystem":true,"runAsGroup":65532,"runAsNonRoot":true,"runAsUser":65532,"seccompProfile":{"type":"RuntimeDefault"}}`  
+
+  [Security context](https://kubernetes.io/docs/tasks/configure-pod-container/security-context/#set-the-security-context-for-a-container) for the OPA container. Defaults to a hardened, non-root, read-only-root configuration. Override fields explicitly if your environment requires it.
+* `opa.resources` - object, default: `{"limits":{"memory":"512Mi"},"requests":{"cpu":"250m","memory":"256Mi"}}`  
+
+  Resource requests and limits for the OPA container.
+  Set to `{}` to opt out of any resource defaults.
+* `opa.livenessProbe.initialDelaySeconds` - int, default: `5`
+* `opa.livenessProbe.periodSeconds` - int, default: `10`
+* `opa.livenessProbe.timeoutSeconds` - int, default: `5`
+* `opa.livenessProbe.failureThreshold` - int, default: `3`
+* `opa.livenessProbe.successThreshold` - int, default: `1`
+* `opa.readinessProbe.initialDelaySeconds` - int, default: `5`
+* `opa.readinessProbe.periodSeconds` - int, default: `10`
+* `opa.readinessProbe.timeoutSeconds` - int, default: `5`
+* `opa.readinessProbe.failureThreshold` - int, default: `3`
+* `opa.readinessProbe.successThreshold` - int, default: `1`
 * `headerAuthenticator` - object, default: `{}`  
 
   [Header authenticator](https://trino.io/docs/current/develop/header-authenticator.html) configuration. Required when `server.config.authenticationType` contains `HEADER`.
@@ -332,35 +467,39 @@ Fast distributed SQL query engine for big data analytics that helps you explore 
   ```
 * `additionalNodeProperties` - list, default: `[]`  
 
-  [Additional node properties](https://trino.io/docs/current/installation/deployment.html#log-levels).
+  [Additional node properties](https://trino.io/docs/current/installation/deployment.html#log-levels). Supports templating the entries with `tpl`; an entry that renders empty is omitted.
   Example, assuming the NODE_ID environment variable has been set:
   ```yaml
    - node.id=${NODE_ID}
+   - 'node.pool={{ .Values.global.nodePoolId }}'
   ```
 * `additionalConfigProperties` - list, default: `[]`  
 
-  [Additional config properties](https://trino.io/docs/current/admin/properties.html).
+  [Additional config properties](https://trino.io/docs/current/admin/properties.html). Supports templating the entries with `tpl`; an entry that renders empty is omitted.
   Example:
   ```yaml
    - internal-communication.shared-secret=random-value-999
    - http-server.process-forwarded=true
+   - '{{ if .Values.global.monitoring.enabled }}tracing.enabled=true{{ end }}'
   ```
 * `additionalLogProperties` - list, default: `[]`  
 
-  [Additional log properties](https://trino.io/docs/current/installation/deployment.html#log-levels).
+  [Additional log properties](https://trino.io/docs/current/installation/deployment.html#log-levels). Supports templating the entries with `tpl`; an entry that renders empty is omitted.
   Example:
   ```yaml
    - io.airlift=DEBUG
+   - 'io.trino.plugin.hive={{ .Values.global.hiveLogLevel }}'
   ```
 * `additionalExchangeManagerProperties` - list, default: `[]`  
 
-  [Exchange manager properties](https://trino.io/docs/current/admin/fault-tolerant-execution.html#exchange-manager).
+  [Exchange manager properties](https://trino.io/docs/current/admin/fault-tolerant-execution.html#exchange-manager). Supports templating the entries with `tpl`; an entry that renders empty is omitted.
   Example:
   ```yaml
    - exchange.s3.region=object-store-region
    - exchange.s3.endpoint=your-object-store-endpoint
    - exchange.s3.aws-access-key=your-access-key
    - exchange.s3.aws-secret-key=your-secret-key
+   - 'exchange.s3.region={{ .Values.global.objectStoreRegion }}'
   ```
 * `sessionProperties` - object, default: `{}`  
 
@@ -370,12 +509,13 @@ Fast distributed SQL query engine for big data analytics that helps you explore 
   * `properties`, and provide configuration properties in `properties`.
 * `eventListenerProperties` - list, default: `[]`  
 
-  [Event listener](https://trino.io/docs/current/develop/event-listener.html#event-listener) properties. To configure multiple event listeners, add them in `coordinator.additionalConfigFiles` and `worker.additionalConfigFiles`, and set the `event-listener.config-files` property in `additionalConfigProperties` to their locations.
+  [Event listener](https://trino.io/docs/current/develop/event-listener.html#event-listener) properties. To configure multiple event listeners, add them in `coordinator.additionalConfigFiles` and `worker.additionalConfigFiles`, and set the `event-listener.config-files` property in `additionalConfigProperties` to their locations. Supports templating the entries with `tpl`; an entry that renders empty is omitted, and no event listener file is written when every entry does.
   Example:
   ```yaml
    - event-listener.name=custom-event-listener
    - custom-property1=custom-value1
    - custom-property2=custom-value2
+   - 'custom-property3={{ .Values.global.customValue }}'
   ```
 * `catalogs` - object, default: `{"tpcds":"connector.name=tpcds\ntpcds.splits-per-node=4\n","tpch":"connector.name=tpch\ntpch.splits-per-node=4\n"}`  
 
@@ -462,6 +602,43 @@ Fast distributed SQL query engine for big data analytics that helps you explore 
 * `service.nodePort` - string, default: `""`  
 
   The port the service listens on the host, for the `NodePort` type. If not set, Kubernetes will [allocate a port automatically](https://kubernetes.io/docs/concepts/services-networking/service/#nodeport-custom-port).
+* `service.appProtocols` - object, default: `{}`  
+
+  The [application protocol](https://kubernetes.io/docs/concepts/services-networking/service/#application-protocol) of a service port, keyed by the name of the port. A service mesh reads it to choose the protocol it speaks to the pods, which is what keeps an HTTP/2 client from being downgraded to HTTP/1.1. The names of the ports are `http`, `https`, `jmx-exporter`, and the `name` of every entry in `additionalExposedPorts`. There is no default, because the right value differs per port: `kubernetes.io/h2c` means cleartext HTTP/2, so it is wrong for a TLS port and for a port that does not speak HTTP at all.
+  Example
+  ```yaml
+  appProtocols:
+    http: kubernetes.io/h2c
+    https: https
+  ```
+* `service.loadBalancerSourceRanges` - list, default: `[]`  
+
+  The client address ranges allowed to reach the service, for the `LoadBalancer` type. The cloud provider turns them into the load balancer's own access rules, such as the security group of an AWS NLB. If empty or not set, the load balancer accepts traffic from anywhere.
+  Example
+  ```yaml
+  loadBalancerSourceRanges:
+    - 1.2.3.4/32
+    - 10.0.0.0/8
+  ```
+* `service.coordinator` - object, default: `{}`  
+
+  Override service configurations for the coordinator service.
+  Example
+  ```yaml
+  coordinator:
+    type: LoadBalancer
+    annotations:
+      external-dns.alpha.kubernetes.io/hostname: trino.example.com
+  ```
+* `service.worker` - object, default: `{}`  
+
+  Override service configurations for the worker service. The worker service is headless, so only the settings that apply to a headless service can be overridden. Setting any other one fails the rendering instead of being silently ignored.
+  Example
+  ```yaml
+  worker:
+    annotations:
+      consul.hashicorp.com/service-sync: "false"
+  ```
 * `auth` - object, default: `{}`  
 
   Available authentication methods.
@@ -508,6 +685,16 @@ Fast distributed SQL query engine for big data analytics that helps you explore 
   ```yaml
    - name: sample-secret
      secretName: sample-secret
+     path: /secrets/sample.json
+     subPath: sample.json
+  ```
+* `csiSecretMounts` - list, default: `[]`  
+
+  Allows mounting secrets on all nodes using the [Secrets Store CSI driver](https://secrets-store-csi-driver.sigs.k8s.io/). Each entry creates a volume of type `secrets-store.csi.k8s.io` referencing a `SecretProviderClass` and a matching volume mount on the Trino container. This enables consuming secrets from external stores (AWS Secrets Manager, HashiCorp Vault, Azure Key Vault, etc.) without first materializing a Kubernetes `Secret`. Requires the driver and its provider to be installed in the cluster, and the `SecretProviderClass` to exist in the release namespace.
+  Example:
+  ```yaml
+   - name: sample-csi-secret
+     secretProviderClass: sample-secret-provider-class
      path: /secrets/sample.json
      subPath: sample.json
   ```
@@ -679,6 +866,16 @@ Fast distributed SQL query engine for big data analytics that helps you explore 
      path: /secrets/sample.json
      subPath: sample.json
   ```
+* `coordinator.csiSecretMounts` - list, default: `[]`  
+
+  Allows mounting secrets on the coordinator node using the [Secrets Store CSI driver](https://secrets-store-csi-driver.sigs.k8s.io/). Each entry creates a volume of type `secrets-store.csi.k8s.io` referencing a `SecretProviderClass` and a matching volume mount on the Trino container. This enables consuming secrets from external stores (AWS Secrets Manager, HashiCorp Vault, Azure Key Vault, etc.) without first materializing a Kubernetes `Secret`. Requires the driver and its provider to be installed in the cluster, and the `SecretProviderClass` to exist in the release namespace.
+  Example:
+  ```yaml
+   - name: sample-csi-secret
+     secretProviderClass: sample-secret-provider-class
+     path: /secrets/sample.json
+     subPath: sample.json
+  ```
 * `worker.deployment.annotations` - object, default: `{}`
 * `worker.deployment.progressDeadlineSeconds` - int, default: `600`  
 
@@ -689,6 +886,14 @@ Fast distributed SQL query engine for big data analytics that helps you explore 
 * `worker.deployment.strategy` - object, default: `{}`  
 
   The deployment strategy to use to replace existing pods with new ones.
+* `worker.podDisruptionBudget` - object, default: `{}`  
+
+  Worker [Pod Disruption Budget](https://kubernetes.io/docs/concepts/workloads/pods/disruptions/#pod-disruption-budgets) configuration. The contents are rendered into the budget's `spec`, so any field the API supports can be set here. Nothing is created while this is empty.
+  ```yaml
+  podDisruptionBudget:
+    # minAvailable and maxUnavailable are mutually exclusive
+    minAvailable: 1
+  ```
 * `worker.jvm.maxHeapSize` - string, default: `"8G"`
 * `worker.jvm.minHeapSize` - string, default: `nil`
 * `worker.jvm.maxHeapPercent` - string, default: `nil`
@@ -763,14 +968,19 @@ Fast distributed SQL query engine for big data analytics that helps you explore 
      exec:
        command: ["/bin/sh", "-c", "sleep 120"]
   ```
-* `worker.gracefulShutdown` - object, default: `{"enabled":false,"gracePeriodSeconds":120}`  
+* `worker.gracefulShutdown` - object, default: `{"enabled":false,"gracePeriodSeconds":120,"user":"admin"}`  
 
   Configure [graceful shutdown](https://trino.io/docs/current/admin/graceful-shutdown.html) in order to ensure that workers terminate without affecting running queries, given a sufficient grace period. When enabled, the value of `worker.terminationGracePeriodSeconds` must be at least two times greater than the configured `gracePeriodSeconds`. Enabling `worker.gracefulShutdown` conflicts with `worker.lifecycle`. When a custom `worker.lifecycle` configuration needs to be used, graceful shutdown must be configured manually.
+  The shutdown request is sent as `user`, and the chart permits that user to read and write system information in
+  the worker access control rules, merging the permissions into the rules set in `accessControl`. Read access is
+  granted as well because the first rule matching a user decides, so a rule granting only write would deny that
+  user every management read.
   Example:
   ```yaml
    gracefulShutdown:
      enabled: true
      gracePeriodSeconds: 120
+     user: admin
   ```
 * `worker.terminationGracePeriodSeconds` - int, default: `30`
 * `worker.nodeSelector` - object, default: `{}`
@@ -871,6 +1081,16 @@ Fast distributed SQL query engine for big data analytics that helps you explore 
      path: /secrets/sample.json
      subPath: sample.json
   ```
+* `worker.csiSecretMounts` - list, default: `[]`  
+
+  Allows mounting secrets on all worker nodes using the [Secrets Store CSI driver](https://secrets-store-csi-driver.sigs.k8s.io/). Each entry creates a volume of type `secrets-store.csi.k8s.io` referencing a `SecretProviderClass` and a matching volume mount on the Trino container. This enables consuming secrets from external stores (AWS Secrets Manager, HashiCorp Vault, Azure Key Vault, etc.) without first materializing a Kubernetes `Secret`. Requires the driver and its provider to be installed in the cluster, and the `SecretProviderClass` to exist in the release namespace.
+  Example:
+  ```yaml
+   - name: sample-csi-secret
+     secretProviderClass: sample-secret-provider-class
+     path: /secrets/sample.json
+     subPath: sample.json
+  ```
 * `kafka.mountPath` - string, default: `"/etc/trino/schemas"`
 * `kafka.tableDescriptions` - object, default: `{}`  
 
@@ -917,10 +1137,36 @@ Fast distributed SQL query engine for big data analytics that helps you explore 
 * `jmx.serverPort` - int, default: `9081`
 * `jmx.exporter.enabled` - bool, default: `false`  
 
-  Set to true to export JMX Metrics via HTTP for [Prometheus](https://github.com/prometheus/jmx_exporter) consumption
-* `jmx.exporter.image` - string, default: `"bitnamilegacy/jmx-exporter:1.4.0"`
-* `jmx.exporter.pullPolicy` - string, default: `"Always"`
+  Set to true to run the [JMX exporter](https://github.com/prometheus/jmx_exporter) as a sidecar and export JMX metrics over its own HTTP port. Every Trino node already serves its metrics itself, see `serviceMonitor.openMetrics`, so this is only needed to keep the exporter's metric names or to reach MBeans the OpenMetrics endpoint does not expose.
+* `jmx.exporter.image` - string, default: `"bitnamilegacy/jmx-exporter:1.4.0"`  
+
+  The upstream project publishes no runnable image, and `bitnamilegacy` is Bitnami's archived namespace, so this tag receives no further updates or CVE patches. It stays the default only because a default has to pull without credentials.
+  Prefer `serviceMonitor.openMetrics`, which needs no sidecar at all. If you
+  do need the sidecar, Docker Hardened Images publishes a maintained
+  `jmx-exporter` under Apache-2.0 at no cost, and pulling it needs a Docker
+  account, so it takes an `imagePullSecrets` entry:
+  ```yaml
+  imagePullSecrets:
+    - name: dhi-credentials
+  jmx:
+    exporter:
+      image: dhi.io/jmx-exporter:TAG
+  ```
+  Pick a tag from the [catalog
+  entry](https://hub.docker.com/hardened-images/catalog/dhi/jmx-exporter),
+  and see [the Docker
+  documentation](https://docs.docker.com/dhi/how-to/use/) for the
+  credentials `dhi.io` expects.
+* `jmx.exporter.pullPolicy` - string, default: `"IfNotPresent"`  
+
+  The default tag is pinned to an immutable image in an archived namespace, so pulling it again on every start would only make that registry a startup dependency.
 * `jmx.exporter.port` - int, default: `5556`
+* `jmx.exporter.env` - list, default: `[]`  
+
+  environment variables specifically for the JMX exporter container, specified as a list with explicit values
+* `jmx.exporter.envFrom` - list, default: `[]`  
+
+  environment variables specifically for the JMX exporter container, specified as a list of either `ConfigMap` or `Secret` references
 * `jmx.exporter.configProperties` - string, default: `""`  
 
   The string value is templated using `tpl`. The JMX config properties file is mounted to `/etc/jmx-exporter/jmx-exporter-config.yaml`.
@@ -997,6 +1243,61 @@ Fast distributed SQL query engine for big data analytics that helps you explore 
 * `serviceMonitor.scrapeTimeout` - string, default: `""`  
 
   Maximum time to wait for a response. If empty or not set, uses the Prometheus global default.
+* `serviceMonitor.openMetrics.enabled` - bool, default: `true`  
+
+  Scrape the [OpenMetrics](https://trino.io/docs/current/admin/openmetrics.html) endpoint every Trino node serves on its own HTTP port. This needs no sidecar, and it is the recommended metrics source. The `jmx.exporter` sidecar is scraped as well whenever a role runs one, so both metric sets can be collected side by side.
+  Trino exports every MBean it registers itself. Add JVM level beans, which
+  it does not register, with the `openmetrics.jmx-object-names` property in
+  `additionalConfigProperties`:
+  ```yaml
+  additionalConfigProperties:
+    - openmetrics.jmx-object-names=java.lang:*
+  ```
+* `serviceMonitor.openMetrics.path` - string, default: `"/metrics"`
+* `serviceMonitor.openMetrics.username` - string, default: `"admin"`  
+
+  The Trino user the scrape authenticates as. Reading `/metrics` is a management read, so a file-based `accessControl` rule set has to allow this user `read` on `system_information` or the scrape gets a 403.
+  ```yaml
+  accessControl:
+    type: configmap
+    rules:
+      rules.json: |-
+        {"system_information": [{"user": "admin", "allow": ["read"]}]}
+  ```
+  `serviceMonitor.worker.enabled` set to `false` stops scraping the workers
+  if you would rather not grant it there.
+* `serviceMonitor.openMetrics.password` - string, default: `""`  
+
+  The password sent with the username, on the coordinator alone: only it is given an authentication type, so a worker rejects a password and rendering fails rather than leaving you a scrape that cannot authenticate. An empty value sends no password, which is what an unsecured cluster wants.
+  An authentication type Prometheus cannot speak, such as `OAUTH2`, has one
+  more way out: `management.user` lets management endpoints through without
+  credentials. It applies to every management endpoint, not just
+  `/metrics`.
+  ```yaml
+  additionalConfigProperties:
+    - management.user=prometheus
+    - management.user.https-enabled=true
+  ```
+* `serviceMonitor.openMetrics.authSecret` - string, default: `""`  
+
+  Name of an existing Secret in the release namespace holding `username` and `password` keys. The chart creates that Secret from the two values above when this is empty.
+* `serviceMonitor.tlsConfig` - object, default: `{}`  
+
+  TLS settings for the scrape, needed when `server.config.https.enabled` is set and Prometheus cannot verify the coordinator's certificate. Only the coordinator serves https, so this reaches its endpoint alone.
+* `serviceMonitor.endpoints` - list, default: `[]`  
+
+  Describe the scrape yourself instead of letting the chart derive it. This replaces the generated endpoints entirely, so nothing else in this block applies to a role that sets it.
+  Example:
+  ```yaml
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 30s
+      relabelings:
+        - action: replace
+          replacement: trino-coordinator
+          targetLabel: job
+  ```
 * `serviceMonitor.coordinator` - object, default: `{}`  
 
   Override ServiceMonitor configurations for the Trino coordinator.
@@ -1006,6 +1307,8 @@ Fast distributed SQL query engine for big data analytics that helps you explore 
     enabled: true
     labels:
       prometheus: my-prometheus
+    openMetrics:
+      username: prometheus
   ```
 * `serviceMonitor.worker` - object, default: `{}`  
 
@@ -1016,6 +1319,8 @@ Fast distributed SQL query engine for big data analytics that helps you explore 
     enabled: true
     labels:
       prometheus: my-prometheus
+    openMetrics:
+      enabled: false
   ```
 * `commonLabels` - object, default: `{}`  
 
@@ -1025,7 +1330,7 @@ Fast distributed SQL query engine for big data analytics that helps you explore 
 * `ingress.annotations` - object, default: `{}`
 * `ingress.hosts` - list, default: `[]`  
 
-  [Ingress rules](https://kubernetes.io/docs/concepts/services-networking/ingress/#ingress-rules).
+  [Ingress rules](https://kubernetes.io/docs/concepts/services-networking/ingress/#ingress-rules). Supports templating the `host` values with `tpl`.
   Example:
   ```yaml
    - host: trino.example.com
@@ -1035,7 +1340,7 @@ Fast distributed SQL query engine for big data analytics that helps you explore 
   ```
 * `ingress.tls` - list, default: `[]`  
 
-  Ingress [TLS](https://kubernetes.io/docs/concepts/services-networking/ingress/#tls) configuration.
+  Ingress [TLS](https://kubernetes.io/docs/concepts/services-networking/ingress/#tls) configuration. Supports templating the `hosts` and `secretName` values with `tpl`.
   Example:
   ```yaml
    - secretName: chart-example-tls
@@ -1148,6 +1453,9 @@ Fast distributed SQL query engine for big data analytics that helps you explore 
        - protocol: TCP
          port: 9999
   ```
+* `extraManifests` - list, default: `[]`  
+
+  Array of extra kubernetes manifests to deploy with the release. Strings are evaluated as a template and can use template expansions and functions. All other objects are used as yaml.
 
 ----------------------------------------------
 Autogenerated from chart metadata using [helm-docs v1.14.2](https://github.com/norwoodj/helm-docs/releases/v1.14.2)
